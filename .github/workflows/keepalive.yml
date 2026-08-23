@@ -1,0 +1,22 @@
+name: supabase-keepalive
+
+on:
+  schedule:
+    # Mon + Thu 03:17 UTC — two pings per 7-day window, so one missed run is still safe.
+    - cron: "17 3 * * 1,4"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Ping every Supabase project (and un-pause any that slept)
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_TARGETS: ${{ secrets.SUPABASE_TARGETS }}
+        run: python keepalive.py --restore
