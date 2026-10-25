@@ -15,8 +15,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Ping every Supabase project (and un-pause any that slept)
+          
+      - name: Ping original Supabase projects
         env:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
           SUPABASE_TARGETS: ${{ secrets.SUPABASE_TARGETS }}
+        run: python keepalive.py --restore
+
+      - name: Ping LCP in its new Supabase organisation
+        if: ${{ !cancelled() }}
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN_LCP }}
         run: python keepalive.py --restore
