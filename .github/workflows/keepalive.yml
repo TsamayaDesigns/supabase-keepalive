@@ -42,3 +42,54 @@ jobs:
         run: |
           python keepalive.py --restore \
             --project jgfktiwpfqexqjkudpxg
+
+      - name: Report successful completion to Healthchecks
+        if: ${{ success() }}
+        env:
+          HEALTHCHECKS_PING_URL: ${{ secrets.HEALTHCHECKS_PING_URL }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${HEALTHCHECKS_PING_URL}" ]]; then
+            echo "::error::HEALTHCHECKS_PING_URL is missing."
+            exit 1
+          fi
+
+          if ! curl --fail --silent \
+            --connect-timeout 10 \
+            --max-time 20 \
+            --retry 2 \
+            --retry-delay 5 \
+            --output /dev/null \
+            "${HEALTHCHECKS_PING_URL}"; then
+            echo "::error::Could not send the success heartbeat."
+            exit 1
+          fi
+
+          echo "Success heartbeat delivered."
+
+      - name: Report failure to Healthchecks
+        if: ${{ failure() }}
+        env:
+          HEALTHCHECKS_PING_URL: ${{ secrets.HEALTHCHECKS_PING_URL }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${HEALTHCHECKS_PING_URL}" ]]; then
+            echo "::warning::Cannot report failure: ping URL is missing."
+            exit 0
+          fi
+
+          if ! curl --fail --silent \
+            --connect-timeout 10 \
+            --max-time 20 \
+            --retry 2 \
+            --retry-delay 5 \
+            --output /dev/null \
+            "${HEALTHCHECKS_PING_URL%/}/fail"; then
+            echo "::warning::Could not deliver the failure heartbeat."
+          else
+            echo "Failure heartbeat delivered."
+          fi
