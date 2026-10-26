@@ -4,6 +4,7 @@ on:
   schedule:
     # Mon + Thu 03:17 UTC — two pings per 7-day window, so one missed run is still safe.
     - cron: "17 3 * * 1,4"
+    - cron: "47 * * * *" # Temporary hourly scheduler test
   workflow_dispatch:
 
 jobs:
