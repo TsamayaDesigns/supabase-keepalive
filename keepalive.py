@@ -1,231 +1,571 @@
 #!/usr/bin/env python3
 """
-supabase-keepalive - stop Supabase free-tier projects from being paused.
+Supabase keepalive for token-based GitHub Actions workflows.
 
-Supabase pauses a free project after 7 days without *database* activity.
-This script generates that activity on a schedule. Stdlib only, no deps.
+Requires Python 3.10+ and the standard library only.
 
-Two ways to point it at a project:
+Configuration:
+    SUPABASE_ACCESS_TOKEN: Supabase personal access token.
 
-  1. TOKEN MODE (recommended - one token, every project you own):
-       SUPABASE_ACCESS_TOKEN=sbp_...  python keepalive.py
-     Lists every project via the Management API, runs `select now()` on each
-     healthy one, and (with --restore) un-pauses ones already INACTIVE.
-     Narrow it with --project <ref | dashboard URL | *.supabase.co URL>.
+Examples:
+    python keepalive.py --restore --project <project-ref>
+    python keepalive.py --project <ref-1> --project <ref-2>
+    python keepalive.py --list
+    python keepalive.py --selftest
 
-  2. TARGET MODE (no token - a project URL + its anon/service key):
-       python keepalive.py --target https://abc.supabase.co,eyJ...,[table]
-     Hits PostgREST. A table name makes it a real DB read; without one it
-     only pings the API root, which is weaker evidence of "activity".
+Behaviour:
+    - Discover projects visible to the token.
+    - Fail if any explicitly requested project is missing.
+    - Query healthy projects with SELECT now().
+    - Optionally request restoration once, wait, and verify a SQL query.
+    - Retry transient errors for discovery and read-only SQL requests.
+    - Continue checking other projects when one fails.
+    - Exit 0 only when all selected projects pass.
 
-Exit code is non-zero if any project failed to ping, so cron/CI notices.
+This is best-effort automation, not a guarantee against inactivity pausing.
+Target mode (--target / SUPABASE_TARGETS) is intentionally not supported.
 """
+
 from __future__ import annotations
 
 import argparse
 import json
 import os
 import re
+import socket
 import sys
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
+
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+
 
 MGMT = "https://api.supabase.com/v1"
-REF_RE = re.compile(r"\b([a-z]{20})\b")
-TIMEOUT = 30
+
+HTTP_TIMEOUT = 20
+MAX_ATTEMPTS = 3
+MAX_RETRY_DELAY = 30
+RESTORE_WAIT_SECONDS = 240
+POLL_SECONDS = 15
+
+TRANSIENT_STATUSES = {408, 429, 500, 502, 503, 504}
+REF_RE = re.compile(r"[a-z]{20}")
 
 
-# --------------------------------------------------------------------------- #
-# helpers
-# --------------------------------------------------------------------------- #
-def log(msg: str) -> None:
-    print(msg, flush=True)
+class KeepaliveError(Exception):
+    """An expected operational failure safe to display in logs."""
 
 
-def http(method: str, url: str, headers: dict | None = None, body: dict | None = None):
-    """Return (status, parsed-json-or-text). Never raises on HTTP errors."""
-    data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(url, data=data, method=method)
-    req.add_header("User-Agent", "supabase-keepalive/1.0")
-    if data is not None:
-        req.add_header("Content-Type", "application/json")
-    for k, v in (headers or {}).items():
-        req.add_header(k, v)
-    try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
-            raw = r.read().decode(errors="replace")
-            status = r.status
-    except urllib.error.HTTPError as e:
-        raw = e.read().decode(errors="replace")
-        status = e.code
-    except (urllib.error.URLError, TimeoutError, OSError) as e:
-        return 0, f"network error: {e}"
-    try:
-        return status, json.loads(raw) if raw else None
-    except json.JSONDecodeError:
-        return status, raw
+class NoRedirects(urllib.request.HTTPRedirectHandler):
+    """Never forward credential-bearing requests through redirects."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
-def parse_ref(value: str) -> str | None:
-    """Accept a bare ref, a dashboard URL, or https://<ref>.supabase.co."""
-    m = REF_RE.search(value.strip())
-    return m.group(1) if m else None
+OPENER = urllib.request.build_opener(NoRedirects())
 
 
-# --------------------------------------------------------------------------- #
-# token mode
-# --------------------------------------------------------------------------- #
-@dataclass
+@dataclass(frozen=True)
 class Project:
     ref: str
     name: str
     status: str
 
 
-def list_projects(token: str) -> list[Project]:
-    status, body = http("GET", f"{MGMT}/projects", {"Authorization": f"Bearer {token}"})
-    if status != 200:
-        sys.exit(f"ERROR: could not list projects (HTTP {status}): {body}\n"
-                 "Check SUPABASE_ACCESS_TOKEN - make it at "
-                 "https://supabase.com/dashboard/account/tokens")
-    return [Project(p["id"], p.get("name", "?"), p.get("status", "?")) for p in body]
+def log(message: str) -> None:
+    print(message, flush=True)
 
 
-def ping_via_token(token: str, ref: str) -> tuple[bool, str]:
-    status, body = http(
-        "POST",
-        f"{MGMT}/projects/{ref}/database/query",
-        {"Authorization": f"Bearer {token}"},
-        {"query": "select now() as pinged_at", "read_only": True},
-    )
-    if status in (200, 201):
-        when = body[0].get("pinged_at") if isinstance(body, list) and body else "ok"
-        return True, f"db says {when}"
-    return False, f"HTTP {status}: {str(body)[:200]}"
+def safe_name(value: str) -> str:
+    """Keep project names on one log line and prevent workflow commands."""
+    value = "".join(c if c.isprintable() else " " for c in value)
+    return value.replace("::", ": :")[:100]
 
 
-def restore_via_token(token: str, ref: str) -> tuple[bool, str]:
-    status, body = http("POST", f"{MGMT}/projects/{ref}/restore",
-                        {"Authorization": f"Bearer {token}"})
-    if status in (200, 201, 202):
-        return True, "restore requested (takes a few minutes; ping again later)"
-    return False, f"HTTP {status}: {str(body)[:200]}"
+def parse_ref(value: str) -> str:
+    """Accept a bare ref or a recognised Supabase project/dashboard URL."""
+    value = value.strip()
+
+    if REF_RE.fullmatch(value):
+        return value
+
+    parsed = urllib.parse.urlsplit(value)
+
+    if (
+        parsed.scheme != "https"
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.port not in (None, 443)
+    ):
+        raise ValueError("Invalid project reference or Supabase URL.")
+
+    host = (parsed.hostname or "").lower()
+
+    if host == "supabase.com":
+        match = re.match(
+            r"^/dashboard/project/([a-z]{20})(?:/|$)",
+            parsed.path,
+        )
+        if match:
+            return match.group(1)
+
+    match = re.fullmatch(r"([a-z]{20})\.supabase\.co", host)
+    if match:
+        return match.group(1)
+
+    raise ValueError("Invalid project reference or Supabase URL.")
 
 
-def run_token_mode(token: str, only: list[str], restore: bool, list_only: bool) -> int:
-    projects = list_projects(token)
-    if only:
-        bad = [v for v in only if parse_ref(v) is None]
-        if bad:
-            sys.exit(f"ERROR: could not find a project ref in: {bad}")
-        wanted = {parse_ref(v) for v in only}
-        unknown = wanted - {p.ref for p in projects}
-        if unknown:
-            log(f"WARN: token cannot see these refs (wrong account/org?): {sorted(unknown)}")
-        projects = [p for p in projects if p.ref in wanted]
+def retry_delay(headers, attempt: int) -> float:
+    """Respect Retry-After where practical, capped to a bounded delay."""
+    fallback = float(2 ** attempt)
+    value = headers.get("Retry-After") if headers else None
 
-    if not projects:
-        log("No projects to ping.")
-        return 1
+    if value:
+        try:
+            seconds = float(value)
+        except ValueError:
+            try:
+                when = parsedate_to_datetime(value)
+                if when.tzinfo is None:
+                    when = when.replace(tzinfo=timezone.utc)
+                seconds = (
+                    when - datetime.now(timezone.utc)
+                ).total_seconds()
+            except (ValueError, TypeError, OverflowError):
+                seconds = fallback
 
-    width = max(len(p.name) for p in projects)
-    failures = 0
-    for p in projects:
-        tag = f"{p.name:<{width}}  {p.ref}  [{p.status}]"
-        if list_only:
-            log(tag)
-            continue
-        if p.status == "ACTIVE_HEALTHY":
-            ok, msg = ping_via_token(token, p.ref)
-        elif p.status == "INACTIVE" and restore:
-            ok, msg = restore_via_token(token, p.ref)
-        elif p.status == "INACTIVE":
-            ok, msg = False, "paused - rerun with --restore to un-pause it"
-        else:
-            ok, msg = False, f"skipped (status {p.status}, not pingable right now)"
-        failures += 0 if ok else 1
-        log(f"{'OK  ' if ok else 'FAIL'}  {tag}  -> {msg}")
-    return 1 if failures else 0
+        return max(0.0, min(seconds, MAX_RETRY_DELAY))
+
+    return min(fallback, MAX_RETRY_DELAY)
 
 
-# --------------------------------------------------------------------------- #
-# target mode
-# --------------------------------------------------------------------------- #
-def run_target_mode(targets: list[str]) -> int:
-    failures = 0
-    for spec in targets:
-        parts = [s.strip() for s in spec.split(",")]
-        if len(parts) < 2 or not parts[0].startswith("http"):
-            log(f"FAIL  bad --target (want URL,KEY[,TABLE]): {spec[:60]}")
-            failures += 1
-            continue
-        url, key = parts[0].rstrip("/"), parts[1]
-        table = parts[2] if len(parts) > 2 else None
-        headers = {"apikey": key, "Authorization": f"Bearer {key}"}
-        if table:
-            status, body = http("GET", f"{url}/rest/v1/{table}?select=*&limit=1", headers)
-            what = f"select from {table}"
-        else:
-            status, body = http("GET", f"{url}/rest/v1/", headers)
-            what = "API root (no table given - add one for a real DB read)"
-        ok = 200 <= status < 300
-        failures += 0 if ok else 1
-        log(f"{'OK  ' if ok else 'FAIL'}  {url}  -> {what}, HTTP {status}"
-            + ("" if ok else f": {str(body)[:200]}"))
-    return 1 if failures else 0
+def remaining_time(deadline: float | None) -> float:
+    if deadline is None:
+        return float(HTTP_TIMEOUT)
+
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise KeepaliveError("Operation deadline reached.")
+
+    return remaining
 
 
-# --------------------------------------------------------------------------- #
-def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--project", action="append", default=[],
-                    help="ref / dashboard URL / *.supabase.co URL to limit token mode to (repeatable)")
-    ap.add_argument("--target", action="append", default=[],
-                    help="URL,KEY[,TABLE] for token-less mode (repeatable)")
-    ap.add_argument("--restore", action="store_true", help="un-pause INACTIVE projects (token mode)")
-    ap.add_argument("--list", action="store_true", help="just list projects + status, no ping")
-    ap.add_argument("--selftest", action="store_true", help=argparse.SUPPRESS)
-    a = ap.parse_args(argv)
+def request_json(
+    token: str,
+    method: str,
+    path: str,
+    body: dict | None = None,
+    *,
+    retry: bool = True,
+    deadline: float | None = None,
+):
+    """
+    Send a request to the fixed Management API host.
 
-    if a.selftest:
-        return selftest()
+    Do not print response bodies: they may contain sensitive information.
+    Restore POSTs use retry=False to avoid blindly repeating mutations.
+    """
+    attempts = MAX_ATTEMPTS if retry else 1
+    encoded = json.dumps(body).encode("utf-8") if body is not None else None
 
-    token = os.environ.get("SUPABASE_ACCESS_TOKEN", "").strip()
-    targets = a.target or [t for t in os.environ.get("SUPABASE_TARGETS", "").split(";") if t.strip()]
+    for attempt in range(1, attempts + 1):
+        timeout = min(HTTP_TIMEOUT, remaining_time(deadline))
 
-    if not token and not targets:
-        sys.exit(
-            "ERROR: nothing to do.\n"
-            "  Either set SUPABASE_ACCESS_TOKEN (personal access token from\n"
-            "  https://supabase.com/dashboard/account/tokens - pings ALL your projects)\n"
-            "  or pass --target https://<ref>.supabase.co,<anon-key>[,<table>]\n"
-            "  (or SUPABASE_TARGETS='url,key,table;url,key,table')."
+        req = urllib.request.Request(
+            MGMT + path,
+            data=encoded,
+            method=method,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "User-Agent": "supabase-keepalive/2.0",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
         )
 
-    rc = 0
-    if token:
-        rc |= run_token_mode(token, a.project, a.restore, a.list)
-    if targets:
-        rc |= run_target_mode(targets)
-    return rc
+        response_headers = None
+
+        try:
+            with OPENER.open(req, timeout=timeout) as response:
+                raw = response.read().decode("utf-8")
+
+            if not raw.strip():
+                return None
+
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError:
+                raise KeepaliveError(
+                    "API returned a successful response with invalid JSON."
+                ) from None
+
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            response_headers = exc.headers
+            exc.close()
+
+            message = f"Management API returned HTTP {status}."
+
+            if status not in TRANSIENT_STATUSES:
+                raise KeepaliveError(message) from None
+
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            socket.timeout,
+            OSError,
+        ):
+            message = "Network request failed or timed out."
+
+        except (UnicodeError, ValueError):
+            raise KeepaliveError(
+                "Invalid API response or request configuration."
+            ) from None
+
+        if attempt == attempts:
+            raise KeepaliveError(message)
+
+        delay = retry_delay(response_headers, attempt)
+
+        if deadline is not None:
+            delay = min(delay, max(0.0, deadline - time.monotonic()))
+
+        log(
+            f"WARN  {message} Retrying "
+            f"({attempt + 1}/{attempts}) after {delay:.0f}s."
+        )
+        time.sleep(delay)
+
+    raise KeepaliveError("Request failed.")
+
+
+def list_projects(
+    token: str,
+    *,
+    deadline: float | None = None,
+) -> list[Project]:
+    body = request_json(token, "GET", "/projects", deadline=deadline)
+
+    if not isinstance(body, list):
+        raise KeepaliveError("Project-list response was not a JSON list.")
+
+    projects = []
+    seen = set()
+
+    for item in body:
+        if not isinstance(item, dict):
+            raise KeepaliveError("Malformed project-list entry.")
+
+        ref = item.get("id")
+        name = item.get("name")
+        status = item.get("status")
+
+        if (
+            not isinstance(ref, str)
+            or not REF_RE.fullmatch(ref)
+            or not isinstance(name, str)
+            or not isinstance(status, str)
+            or ref in seen
+        ):
+            raise KeepaliveError("Invalid or duplicate project-list entry.")
+
+        seen.add(ref)
+        projects.append(Project(ref, safe_name(name), status))
+
+    return projects
+
+
+def ping_project(
+    token: str,
+    ref: str,
+    *,
+    deadline: float | None = None,
+) -> str:
+    body = request_json(
+        token,
+        "POST",
+        f"/projects/{ref}/database/query",
+        {"query": "select now() as pinged_at", "read_only": True},
+        deadline=deadline,
+    )
+
+    if (
+        not isinstance(body, list)
+        or len(body) != 1
+        or not isinstance(body[0], dict)
+        or not isinstance(body[0].get("pinged_at"), str)
+        or not body[0]["pinged_at"].strip()
+    ):
+        raise KeepaliveError(
+            "SQL response did not contain the expected timestamp."
+        )
+
+    return body[0]["pinged_at"]
+
+
+def wait_and_ping(token: str, ref: str, deadline: float) -> str:
+    """Wait for health, then verify SQL, within the recovery deadline."""
+    last_status = None
+
+    while time.monotonic() < deadline:
+        try:
+            projects = list_projects(token, deadline=deadline)
+            project = next((p for p in projects if p.ref == ref), None)
+
+            if project is None:
+                raise KeepaliveError(
+                    "Project disappeared from token visibility."
+                )
+
+            if project.status != last_status:
+                log(f"INFO  {ref}: recovery status {project.status}")
+                last_status = project.status
+
+            if project.status == "ACTIVE_HEALTHY":
+                return ping_project(token, ref, deadline=deadline)
+
+        except KeepaliveError as exc:
+            log(f"WARN  {ref}: recovery check: {exc}")
+
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(POLL_SECONDS, remaining))
+
+    raise KeepaliveError(
+        "Recovery deadline reached; database query was not verified. "
+        "Restoration may still be in progress."
+    )
+
+
+def check_project(token: str, project: Project, restore: bool) -> str:
+    if project.status == "ACTIVE_HEALTHY":
+        return ping_project(token, project.ref)
+
+    if not restore:
+        raise KeepaliveError(
+            f"Project is {project.status}, not ACTIVE_HEALTHY. "
+            "Use --restore to recover paused projects."
+        )
+
+    deadline = time.monotonic() + RESTORE_WAIT_SECONDS
+
+    if project.status == "INACTIVE":
+        log(f"INFO  {project.name} {project.ref}: requesting restoration.")
+
+        try:
+            request_json(
+                token,
+                "POST",
+                f"/projects/{project.ref}/restore",
+                retry=False,
+                deadline=deadline,
+            )
+            log(
+                f"INFO  {project.ref}: restore request accepted; "
+                "waiting for a verified database query."
+            )
+        except KeepaliveError as exc:
+            # A timeout can occur after the server accepted the request.
+            # Do not blindly send another restore request.
+            log(
+                f"WARN  {project.ref}: restore request not confirmed: {exc} "
+                "Checking status without resubmitting."
+            )
+    else:
+        log(
+            f"INFO  {project.ref}: currently {project.status}; "
+            "waiting for health without sending a restore request."
+        )
+
+    return wait_and_ping(token, project.ref, deadline)
+
+
+def print_summary(
+    expected: int,
+    found: int,
+    queried: int,
+    missing: int,
+    failed: int,
+    list_only: bool,
+) -> None:
+    log("")
+    log("SUMMARY")
+    log(f"  Expected projects: {expected}")
+    log(f"  Found projects: {found}")
+    log(f"  Missing projects: {missing}")
+
+    if list_only:
+        log("  Mode: list only; no SQL queries or restores performed")
+    else:
+        log(f"  Successfully queried: {queried}")
+        log(f"  Failed or unverified: {failed}")
+
+    success = expected > 0 and missing == 0 and failed == 0
+    log(f"  Result: {'PASS' if success else 'FAIL'}")
 
 
 def selftest() -> int:
-    cases = {
-        "abcdefghijklmnopqrst": "abcdefghijklmnopqrst",
-        "https://supabase.com/dashboard/project/lzyvawfyrisuyikjsgtk/editor": "lzyvawfyrisuyikjsgtk",
-        "https://ffrsffycrpevjhfyklxs.supabase.co": "ffrsffycrpevjhfyklxs",
-        "https://ffrsffycrpevjhfyklxs.supabase.co/rest/v1/": "ffrsffycrpevjhfyklxs",
-        "not a ref": None,
-        "https://supabase.com/dashboard": None,
-    }
-    for inp, want in cases.items():
-        got = parse_ref(inp)
-        assert got == want, f"parse_ref({inp!r}) = {got!r}, want {want!r}"
-    log(f"selftest: {len(cases)} parse_ref cases OK")
+    ref = "abcdefghijklmnopqrst"
+
+    valid = [
+        ref,
+        f"https://supabase.com/dashboard/project/{ref}",
+        f"https://supabase.com/dashboard/project/{ref}/editor",
+        f"https://{ref}.supabase.co",
+        f"https://{ref}.supabase.co/rest/v1/",
+    ]
+
+    invalid = [
+        "",
+        "not a ref",
+        f"prefix {ref} suffix",
+        f"http://{ref}.supabase.co",
+        f"https://example.com/dashboard/project/{ref}",
+        f"https://{ref}.supabase.co.evil.example",
+        f"https://user:password@{ref}.supabase.co",
+    ]
+
+    for value in valid:
+        if parse_ref(value) != ref:
+            raise KeepaliveError("Valid-reference self-test failed.")
+
+    for value in invalid:
+        try:
+            parse_ref(value)
+        except ValueError:
+            continue
+        raise KeepaliveError("Invalid-reference self-test failed.")
+
+    log(
+        f"Self-test passed: {len(valid) + len(invalid)} "
+        "reference-parser cases. No network requests performed."
+    )
     return 0
 
 
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--project",
+        action="append",
+        default=[],
+        metavar="REF_OR_URL",
+        help="Expected project ref or Supabase URL; repeat for each project.",
+    )
+    parser.add_argument(
+        "--restore",
+        action="store_true",
+        help="Recover paused projects and wait for a verified SQL query.",
+    )
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="List projects and statuses; do not query SQL or restore.",
+    )
+    parser.add_argument(
+        "--selftest",
+        action="store_true",
+        help="Test reference parsing without credentials or network access.",
+    )
+    args = parser.parse_args(argv)
+
+    if args.selftest:
+        return selftest()
+
+    token = os.environ.get("SUPABASE_ACCESS_TOKEN", "").strip()
+    if not token:
+        log("ERROR  SUPABASE_ACCESS_TOKEN is missing or empty.")
+        return 1
+
+    if os.environ.get("SUPABASE_TARGETS", "").strip():
+        log(
+            "ERROR  SUPABASE_TARGETS is configured, but this version "
+            "supports token mode only. Remove that environment variable."
+        )
+        return 1
+
+    try:
+        requested = list(dict.fromkeys(parse_ref(v) for v in args.project))
+    except ValueError:
+        log("ERROR  Invalid --project value; use a ref or Supabase URL.")
+        return 1
+
+    try:
+        projects = list_projects(token)
+    except KeepaliveError as exc:
+        log(f"ERROR  Could not discover projects: {exc}")
+        log("RESULT FAIL: project coverage and SQL checks were not verified.")
+        return 1
+
+    visible = {p.ref: p for p in projects}
+
+    if requested:
+        missing_refs = [ref for ref in requested if ref not in visible]
+        selected = [visible[ref] for ref in requested if ref in visible]
+        expected = len(requested)
+    else:
+        log(
+            "WARN  No --project arguments: checking all visible projects. "
+            "Missing intended projects cannot be detected in this mode."
+        )
+        missing_refs = []
+        selected = projects
+        expected = len(selected)
+
+    for ref in missing_refs:
+        log(f"FAIL  {ref}: expected project is not visible to this token.")
+
+    queried = 0
+    failed = len(missing_refs)
+
+    for project in selected:
+        tag = f"{project.name} {project.ref} [{project.status}]"
+
+        if args.list:
+            log(f"LIST  {tag}")
+            continue
+
+        try:
+            timestamp = pinged_at = check_project(
+                token, project, args.restore
+            )
+            queried += 1
+            log(
+                f"OK    {project.name} {project.ref} "
+                f"[ACTIVE_HEALTHY] -> db says {timestamp}"
+            )
+        except KeepaliveError as exc:
+            failed += 1
+            log(f"FAIL  {tag} -> {exc}")
+        except Exception as exc:
+            failed += 1
+            # Only log the exception type, not possibly sensitive details.
+            log(f"FAIL  {tag} -> unexpected {type(exc).__name__}")
+
+    print_summary(
+        expected=expected,
+        found=len(selected),
+        queried=queried,
+        missing=len(missing_refs),
+        failed=failed,
+        list_only=args.list,
+    )
+
+    return 0 if expected > 0 and failed == 0 else 1
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        log("ERROR  Interrupted.")
+        sys.exit(130)
+    except Exception as exc:
+        log(f"ERROR  Unexpected {type(exc).__name__}; run not verified.")
+        sys.exit(1)
