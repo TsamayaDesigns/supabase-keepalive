@@ -2,29 +2,43 @@ name: supabase-keepalive
 
 on:
   schedule:
-    # Mon + Thu 03:17 UTC — two pings per 7-day window, so one missed run is still safe.
-    - cron: "17 3 * * 1,4"
-    - cron: "47 * * * *" # Temporary hourly scheduler test
+    # Daily at 05:00 UTC.
+    - cron: "00 5 * * *"
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: supabase-keepalive-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   ping:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 20
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          
-      - name: Ping original Supabase projects
+
+      - name: Ping CopyEngine and Lighthouse Goals
         env:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
-          SUPABASE_TARGETS: ${{ secrets.SUPABASE_TARGETS }}
-        run: python keepalive.py --restore
+        run: |
+          python keepalive.py --restore \
+            --project hozgmfumpzphanvykemt \
+            --project jibclxfdxyrimgovhcih
 
       - name: Ping LCP in its new Supabase organisation
         if: ${{ !cancelled() }}
         env:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN_LCP }}
-        run: python keepalive.py --restore
+        run: |
+          python keepalive.py --restore \
+            --project jgfktiwpfqexqjkudpxg
