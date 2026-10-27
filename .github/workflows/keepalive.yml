@@ -2,7 +2,7 @@ name: supabase-keepalive
 
 on:
   schedule:
-    # Daily at 05:00 UTC.
+    # Daily at 05:17 UTC.
     - cron: "17 5 * * *"
 
     # Temporary test: every 15 minutes, offset from minute zero.
