@@ -5,8 +5,9 @@ on:
     # Daily at 05:00 UTC.
     - cron: "17 5 * * *"
 
-    # Temporary test: every 15 minutes.
-    - cron: "*/15 * * * *"
+    # Temporary test: every 15 minutes, offset from minute zero.
+    - cron: "7,22,37,52 * * * *"
+    
   workflow_dispatch:
 
 permissions:
