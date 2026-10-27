@@ -3,7 +3,10 @@ name: supabase-keepalive
 on:
   schedule:
     # Daily at 05:00 UTC.
-    - cron: "00 5 * * *"
+    - cron: "17 5 * * *"
+
+    # Temporary test: every 15 minutes.
+    - cron: "*/15 * * * *"
   workflow_dispatch:
 
 permissions:
